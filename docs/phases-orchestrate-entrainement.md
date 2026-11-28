@@ -17,7 +17,30 @@
 >   à 65535 (uint16_t, rejet propre au-delà), système de
 >   **16 instances × `64,65535` = 1 049 584 neurones** via `/orchestrate`
 >   (run done, 16/16 instances OK, ~17 Mo/instance).
-> - ⏳ B3/A3/A4/B4 : reste (voir sections ci-dessous).
+> - ✅ **A1b** livrée : `/orchestrate` passé en **netfs** (nœuds
+>   `status`/`result` en lecture POSIX pure, canal de commandes sur la
+>   racine). `make check` 5/5 hôte + VM Hurd.
+> - ✅ **A3** livrée : `{"command":"history"}` et
+>   `{"command":"replay","run_id":N}` sur `/orchestrate`, lecture
+>   `{"select":…}` côté `/db` (contrat étendu, `make check` 4/4).
+>   Replay vérifié `match:true` sur VM.
+> - ✅ **B3** livrée : `/entrainement --from FILE [--resume]
+>   [--cron "EXPR"]` — ingestion multi-sources idempotente (table
+>   `ingest_jobs`), compteurs traités/sautés/doublons/erreurs,
+>   entrée crontab + log `/root/.entrainement.log`. Vérifié sur VM :
+>   `count(*)` stable au second passage.
+> - ✅ **A4** livrée : score cosinus par instance persisté dans
+>   `run_instances.score`, poids d'agrégation appris (EMA 0.7/0.3)
+>   versionnés dans `aggregator_state`, `"topologies": "auto"`
+>   (top-K de l'historique), commande `{"command":"watch"}`.
+> - ✅ **B4** livrée : `/good` `/bad` notent la dernière réponse
+>   `/reply` dans la table `feedback` ; `/entrainement
+>   --from-feedback` ré-ingère les exemples « good » (idempotent,
+>   SHA-256) et versionne le modèle `.nn` du neurone (hex) dans la
+>   table `models`. Vérifié sur VM : `doublons=2` au second run,
+>   modèle v1→v3.
+> - 🎉 **Toutes les phases A1b/A3/B3/A4/B4 sont livrées, testées sur
+>   VM Debian GNU/Hurd et poussées sur `main`** (2026-11-28).
 
 Proposition de suite, en continuité des `PLAN.md` existants
 (`orchestrator-translator` : phases 0–1 livrées et vérifiées sur
@@ -152,7 +175,7 @@ Aujourd'hui `/entrainement` échoue avec « aucun neurone monté
 
 ---
 
-## Prochaines phases — spécification détaillée (reste à faire)
+## Spécification détaillée des phases livrées (archive)
 
 ### B3 — Multi-sources et planification de `/entrainement`
 
@@ -247,13 +270,17 @@ prévoit l'arborescence netfs pour le streaming :
   requêtes fixe (test déterministe) ; le modèle versionné est
   rechargeable (`load`) et redonne les mêmes sorties.
 
-### Ordre conseillé (reste)
+### Ordre conseillé — ✅ tout est livré (2026-11-28)
 
-1. **A1b** (netfs) — débloque le streaming POSIX pur, base de `watch`.
-2. **A3** (replay/history/stats) — audit + rejouabilité, réseau coupé.
-3. **B3** (multi-sources + cron + `--resume`) — ingestion de corpus.
-4. **A4** (scores + agrégation apprise + `topologies: "auto"`).
-5. **B4** (feedback + ré-entraînement + modèle versionné).
+1. ✅ **A1b** (netfs) — streaming POSIX pur, base de `watch`.
+2. ✅ **A3** (replay/history/stats) — audit + rejouabilité, réseau coupé.
+3. ✅ **B3** (multi-sources + cron + `--resume`) — ingestion de corpus.
+4. ✅ **A4** (scores + agrégation apprise + `topologies: "auto"`).
+5. ✅ **B4** (feedback + ré-entraînement + modèle versionné).
+
+Commits sur `main` : orchestrator `a277406`, data-base `06214ce`,
+inference `8a16e84`. Tests : `make check` vert sur hôte et VM Hurd
+(orchestrator 5/5, data-base 4/4, inference 6/6 sur Hurd).
 
 ### Dépendances à geler (bump de contrat `/db`)
 
