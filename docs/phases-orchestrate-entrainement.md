@@ -149,3 +149,114 @@ Aujourd'hui `/entrainement` échoue avec « aucun neurone monté
   du schéma PostgreSQL gelé (fait).
 - B4 dépend de A4 (scores) et d'un schéma `feedback` à geler dans
   `data-base-translator` (bump de version du contrat `/db`).
+
+---
+
+## Prochaines phases — spécification détaillée (reste à faire)
+
+### B3 — Multi-sources et planification de `/entrainement`
+
+**Objectif** : ingérer des corpus entiers de façon incrémentale et
+reprenables, sans passer par une session interactive.
+
+- Contrat de commande :
+  - `/entrainement --from FILE` : FILE contient une URL `hf://` ou
+    `https://` par ligne (`#` = commentaire) ;
+  - `/entrainement --from FILE --resume` : saute les URLs déjà en
+    cache (mécanisme B2) ;
+  - `/entrainement --from FILE --cron "*/30 * * * *"` : planification
+    côté Hurd (entrée `crontab`), chaque run journalisé dans
+    `/root/.entrainement.log` avec compteurs (traités / sautés /
+    doublons / erreurs).
+- Persistance de l'état d'ingestion : table `ingest_jobs` (à geler
+  dans `data-base-translator`, bump de contrat) : `source_url`,
+  `last_run`, `status`, `records_added` — pour éviter de re-lister
+  l'arbre HF à chaque passage (cache de l'arbre 24 h).
+- **Livrable** : ingestion multi-sources idempotente + cron.
+- **Acceptation** : deux exécutions successives du même `--from`
+  n'ajoutent aucune ligne (`select count(*)` stable) ; un fichier
+  supprimé du dépôt local n'est pas re-téléchargé avec `--resume` ;
+  le log cron montre les compteurs.
+- **Tests** : `make check` + scénario VM (liste de 3 sources, run
+  deux fois, `count(*)` identique).
+
+### A3 — Rejouabilité : `replay` et `history` sur `/orchestrate`
+
+**Objectif** : rejouer et auditer des exécutions depuis la base,
+réseau coupé.
+
+- Nouvelles commandes (contrat à geler, SPEC §5 phase 2+) :
+  - `{"command": "replay", "run_id": N}` : lit le descripteur et les
+    entrées de `runs`/`run_instances`, relance les instances avec la
+    même graine (neuron `seed`), compare les sorties, répond
+    `{"run_id": N, "replay_id": M, "match": true|false, "diff": [...]}` ;
+  - `{"command": "history", "limit": 20}` : dernières exécutions avec
+    stratégie, confiance, nb d'incidents ;
+  - `{"command": "stats"}` : performances par topologie (moyenne de
+    confiance, taux d'échec) calculées depuis `run_instances`.
+- Lecture en phase 1 via le protocole de lignes (trivfs) ; les nœuds
+  fichiers `/orchestrate/status|result|history` arrivent avec le
+  passage netfs (A1, section suivante).
+- **Livrable** : replay/history/stats opérationnels.
+- **Acceptation** : `replay` d'un run A2 avec le réseau coupé produit
+  un résultat identique (graine fixée) ; `stats` reflète les incidents
+  persistés en A1.
+
+### A1b — Passage netfs de `/orchestrate` (nœuds fichiers)
+
+A1 a livré l'asynchrone via le protocole de lignes. Le contrat gelé
+prévoit l'arborescence netfs pour le streaming :
+
+- `/orchestrate/status`, `/orchestrate/result`, `/orchestrate/history`
+  servis comme fichiers, **un curseur par lecteur** (même mécanisme
+  que `/db`) : `cat /orchestrate/status` en boucle suit le run en
+  direct.
+- Migration trivfs → netfs dans `main-hurd.c`/`trivfs-hooks.c` ;
+  le moteur (`orchestrate.c`) ne change pas.
+- **Acceptation** : `watch`-like en POSIX pur (`while :; do
+  cat /orchestrate/status; sleep 1; done`) montre running → done ;
+  `make check` toujours vert (le REPL reste trivfs-compatible).
+
+### A4 — Évaluateur et agrégation pondérée apprise
+
+- Score par instance : accord inter-instances (cosinus des vecteurs de
+  sortie) + cohérence avec l'historique ; champ `score` de
+  `run_instances` enfin renseigné.
+- Pondérations d'agrégation apprises : table `aggregator_state`
+  (topologie → poids), mise à jour après chaque run à partir des
+  scores, versionnée (`version` croissant).
+- Sélection de topologies : le descripteur accepte
+  `"topologies": "auto"` → choisit les K meilleures topologies de
+  l'historique.
+- **Acceptation** : sur un jeu étiqueté de 20 runs, l'agrégation
+  pondérée apprise bat `majority` et `mean` uniformes (précision
+  mesurée) ; `auto` sélectionne une topologie du top-3 historique.
+
+### B4 — Boucle d'apprentissage (feedback → ré-entraînement)
+
+- Nouveau contrat `/db` : table `feedback` (à geler) :
+  `id, run_id NULLABLE, source_url, query, rating INT, created_at`.
+- Côté client : `/good` / `/bad` après une réponse `/reply` ou un
+  résultat d'orchestration → écrit une ligne `feedback` dans `/db`.
+- `/entrainement --from-feedback` : ré-ingère les exemples notés
+  `rating > 0`, ajuste les poids du neurone éphémère (`save`/`load`
+  `.nn`), et stocke le modèle versionné dans `/db` (colonne
+  `model_blob` ou table `models` à geler).
+- **Acceptation** : après 10 feedbacks positifs sur un type de
+  requête, `/reply` classe la bonne source en rang 1 sur un jeu de
+  requêtes fixe (test déterministe) ; le modèle versionné est
+  rechargeable (`load`) et redonne les mêmes sorties.
+
+### Ordre conseillé (reste)
+
+1. **A1b** (netfs) — débloque le streaming POSIX pur, base de `watch`.
+2. **A3** (replay/history/stats) — audit + rejouabilité, réseau coupé.
+3. **B3** (multi-sources + cron + `--resume`) — ingestion de corpus.
+4. **A4** (scores + agrégation apprise + `topologies: "auto"`).
+5. **B4** (feedback + ré-entraînement + modèle versionné).
+
+### Dépendances à geler (bump de contrat `/db`)
+
+- `ingest_jobs` (B3), `feedback` + `models` (B4),
+  `aggregator_state` (A4) — schéma dans `data-base-translator`,
+  tests `test_contract`/`test_pg.sh` à étendre à chaque table.
